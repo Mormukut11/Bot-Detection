@@ -1,0 +1,11 @@
+This article will present a way to detect bots in online auctions. This is how Kaggle presented the problem: “Human bidders on the site are becoming increasingly frustrated with their inability to win auctions vs. their software-controlled counterparts. As a result, usage from the site’s core customer base is plummeting.”
+
+Here the problem at hand is binary classification with two interesting properties. The data contains approximately 4% users identified as robots, which makes an unbalanced classification problem. the data corresponding to each bidder, if used completely, becomes bigger than the data points(number of observations). In other words, this can potentially become a p>>n where p is the number of variables and n is the number of observations.
+
+Next, I will present a way to identify robots with a score of approximately 0.927 AUC with the data available plus additional considerations for improving the score according to other participants on Kaggle.
+
+The model here described needs approximately 6-7GB of memory during the data mining only because it is done in parallel for increased performance. But if you choose to run it sequentially the memory fingerprint won’t surpass 2GB. The main algorithm training won’t require much memory either.
+
+The data can be downloaded on: https://www.kaggle.com/c/facebook-recruiting-iv-human-or-bot/data
+
+Note: This markdown guide does not execute the code but it simply comments different parts of the code and includes images whenever necessary. The reason for this is that even though the code is not computationally intensive, the creation of a HTML and execution of the code in knitr is. For the full code implementation and other functions here not present please refer to the repository https://github.com/wacax/Facebook-Recruiting-IV
