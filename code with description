@@ -1,0 +1,174 @@
+require("rjson")
+require("parallel")
+require("data.table")
+require("bit64")
+require("leaps")
+require("tm")
+require("xgboost")
+require("SparseM")
+require("prospectr")
+require("Metrics")
+require("ggplot2")
+
+#Read Settings file
+directories <- fromJSON(file = "SETTINGS.json")
+
+#Set Directories
+workingDirectory <- directories$workingDirectory
+setwd(workingDirectory)
+#Set Data Directory
+dataDirectory <- directories$dataDirectory
+#EDA Plots location
+EDAPlotsLoc <- directories$EDALoc
+
+#Define extra functions
+source(file.path(workingDirectory, "bidderId2Boilerplate.R"))
+source(file.path(workingDirectory, "timeNumericFeatures.R"))
+source(file.path(workingDirectory, "featureLengths.R"))
+source(file.path(workingDirectory, "dispersionTimeFeatures.R"))
+source(file.path(workingDirectory, "simultaneousAuctionTimeFinder.R"))
+source(file.path(workingDirectory, "multiplot.R"))
+
+#Detect available cores
+numCores <- detectCores()
+Load Data
+Now we load the data into R; I have found that using the option “verbose” when loading the data into memory is often a good idea since it shows the amount of memory used and other interesting statistics such as number of NAs.
+
+train <- fread(file.path(dataDirectory, directories$trainFile), verbose = TRUE)
+test <- fread(file.path(dataDirectory, directories$testFile), verbose = TRUE)
+bids <- fread(file.path(dataDirectory, directories$bids), verbose = TRUE)
+Data Transformations
+Some transformations are required but not completely needed, this is done in order to guarantee randomness and increase slightly performance. Feel free to edit this part.
+
+#Remove training data that cannot be found in the bids data table
+train <- train[train$bidder_id %in% bids$bidder_id]
+#Shuffle Training Dataset
+set.seed(1011011)
+train <- train[sample(1:nrow(train), nrow(train))]
+#Remove testing data that cannot be found in the bids data table
+validTestDocuments <- which(test$bidder_id %in% bids$bidder_id)
+test <- test[test$bidder_id %in% bids$bidder_id]
+
+#Sort bids by time
+bids <- bids[order(rank(-time))]
+
+#No Country change to "NoCountry" string
+bids$country[bids$country == ""] <- "nocountry"
+#Add more letters to countries to avoid deletion by the tm package
+bids$country <- paste0("country", bids$country)
+
+#Auction Time Medians + Median Average Deviations
+auctionsScoresTable <- mclapply(unique(bids$auction), timeNumericFeatures, mc.cores = numCores,
+                                bidsDt = bids)
+
+auctionsScoresTable <- do.call(rbind, auctionsScoresTable)
+
+#Merge standard scores with bids data
+bids <- merge(bids, auctionsScoresTable, by = "bid_id")
+#Orphan auctions / bids transform secuential value to FALSE
+bids$sequential[is.na(bids$sequential)] <- FALSE
+rm(auctionsScoresTable)
+Feature Engineering
+The Bulk of computer time is spend here. Feature engineering in this problem is what defines how precise the model really is. Here I propose 3 different types of numeric features types within which there are further features mainly being statistical-dispersion features of bidders. The additional features extracted from the dataset are:
+
+Dispersion Features
++Time Range Of Activity across all auctions
++Time Range Of Activity, first derivative
++Resting Time across all auctions, time without bids since the beginning of the auction
++Resting Time, first derivative
++Time between the final bid and end of auction
++Time between the final bid and end of auction, first derivative
++Linear Fit of previous features
+
+The code can be found on: https://github.com/wacax/Facebook-Recruiting-IV/blob/master/dispersionTimeFeatures.R and lines 81-126 on https://github.com/wacax/Facebook-Recruiting-IV/blob/master/FacebookRaw.R
+
+Feature Lengths
++Statistical Features of Bidder’s Auctions
++Statistical Features of Bidder’s Device
++Statistical Features of Bidder’s Country
++Statistical Features of Bidder’s Ips
++Statistical Features of Bidder’s Urls
+The code can be found on: https://github.com/wacax/Facebook-Recruiting-IV/blob/master/featureLengths.R and lines 128-141 on https://github.com/wacax/Facebook-Recruiting-IV/blob/master/FacebookRaw.R
+
+Simultaneous Actions
++Frequencies in Bids +Simultaneous Auctions +Simultaneous Devices +Simultaneous Countries The code can be found on: https://github.com/wacax/Facebook-Recruiting-IV/blob/master/simultaneousAuctionTimeFinder.R and lines 143-166 on https://github.com/wacax/Facebook-Recruiting-IV/blob/master/FacebookRaw.R
+
+At the beginning the code looked for simultaneous, that is, actions with matching times. However, after correlations search and cross validations it was found that if we searched actions within a certain window of time, the function would yield better results. More information about the parameter search for this function can be found on https://github.com/wacax/Facebook-Recruiting-IV/blob/master/FacebookRaw.R lines 233-288
+
+All Bidder’s data
+There are two possibilities. One is to leave the numerical features and try to extract more features like it was suggested on the forum https://www.kaggle.com/c/facebook-recruiting-iv-human-or-bot/forums/t/14628/share-your-secret-sauce and the other is the one that I used that is extracting every single unique value from the bids data. https://github.com/wacax/Facebook-Recruiting-IV/blob/master/FacebookRaw.R lines 168-178 If you choose this way the result will be a matrix where p>>n that is where the features are more than the data points.
+
+EDA
+We now can look for the best features in this set. Linear Feature Selection
+
+Unsurprisingly, almost all data is useful. So as a recommendation it is better to keep all the numeric data in case you are training with a tree based algorithm.
+
+Cross Validation and Modeling
+Given that this dataset only contains 1984 rows of valid data, cross validation is of vital importance. I explored two different approaches, linear modeling with elastic-net regularization with the glmnet package and boosted trees with the xgboost library. In this case xgboost was clearly superior.
+
+The cross validation was performed with the following code:
+
+#Cross validation
+numberOfRepeatedModels <- 10
+xgboostAUC <- sapply(seq(1, numberOfRepeatedModels), function(modelNumber, train){
+  
+  xgboostModelCV <- xgb.cv(data = train, nrounds = 70, nfold = 5, showsd = TRUE, 
+                           metrics = "auc", verbose = TRUE, "eval_metric" = "auc",
+                           "objective" = "binary:logistic", "max.depth" = 80, 
+                           "nthread" = numCores, "set.seed" = 101010 + modelNumber)
+  
+  #Plot the progress of the model
+  holdoutAucScores <- as.data.frame(xgboostModelCV)
+  holdoutAucScores$test.auc.mean <- as.numeric(holdoutAucScores$test.auc.mean)
+  holdoutAucScores$iteration <- seq(1, nrow(holdoutAucScores))
+  print(ggplot(data = holdoutAucScores, aes(x = iteration, y = test.auc.mean)) + geom_line())
+  
+  #Save AUC and the location of the best iteration
+  auc <- max(movav(holdoutAucScores$test.auc.mean, w = 5))
+  bestIter <- which.max(movav(holdoutAucScores$test.auc.mean, w = 5)) + 2
+  
+  print(paste0("model number ", modelNumber, " has an AUC of: ", auc))
+  return(c(auc, bestIter, as.numeric(holdoutAucScores$test.auc.mean)))
+  
+}, train = DMMatrixTrain)
+
+print(paste0("average AUC of ",  mean(xgboostAUC[1, ]), " with ", numberOfRepeatedModels, " models."))
+bestIteration <- floor(mean(xgboostAUC[2, ]))
+
+#xgboost cross validation plot with n models
+holdoutAucScores <- as.data.frame(xgboostAUC[3:nrow(xgboostAUC), ])
+holdoutAucScores$iteration <- seq(1, nrow(holdoutAucScores))
+ggplot() + geom_line(data = holdoutAucScores, aes(x = iteration, y = V1), colour = 'red') +
+  geom_line(data = holdoutAucScores, aes(x = iteration, y = V2), colour = 'blue') + 
+  geom_line(data = holdoutAucScores, aes(x = iteration, y = V3), colour = 'magenta') +
+  geom_line(data = holdoutAucScores, aes(x = iteration, y = V4), colour = 'green') +
+  geom_line(data = holdoutAucScores, aes(x = iteration, y = V5), colour = 'black')
+Repeated Cross Validation
+
+As you might have probably guessed this is a repeated cross-validation. This is done to ensure the accuracy of the AUC value and to avoid overfitting. This idea is thanks to Manuel Amunategui. For more information about repeated cross validation check out https://www.youtube.com/watch?v=Og7CGAfSr_Y
+
+Now we have an idea about the approximate accuracy of our model so now we start building the real model with all the data and with variable importance calculation to see what variables are the most important. For that we will choose the 50 most important variables to display.
+
+#Full Model with slow learning (eta = 0.003)
+xgboostModelSlow <- xgboost(data = DMMatrixTrain, nrounds = 6000,
+                            showsd = TRUE, metrics = "auc", verbose = TRUE, "eta" = 0.001,
+                            "objective" = "binary:logistic", "max.depth" = 80, "eval_metric" = "auc",
+                            "colsample_bytree" = 0.95,
+                            "set.seed" = 10001001)
+
+model <- xgb.dump(xgboostModelSlow, with.stats = T)
+
+#Plot feature importance  
+# Compute feature importance matrix
+importanceMatrix <- xgb.importance(c(engineeredFeaturesNames, corpusTerms), model = xgboostModelSlow)  
+#Importance graph
+print(xgb.plot.importance(importanceMatrix[1:50,]))
+#Save Plot
+dev.print(file = file.path(EDAPlotsLoc , "VariableImportanceSlowModel"),
+          device = png, width = 1200)
+
+#Predict
+xgboostPredictionSlow <- predict(xgboostModelSlow, DMMatrixTest)
+Variable Importance
+
+Our model is now ready and the variable importance are ready too. What is interesting here is that there are certain auctions, devices, Urls and IPs that are related to bots directly or at least are suspicious. So even after modeling you can also check what raw variables are related to suspicious activity and suspicious behavior thanks to our statistical/numerical data.
